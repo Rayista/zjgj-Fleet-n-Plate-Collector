@@ -223,6 +223,18 @@ def get_one_line_vehicle_info(line, mark, scan_date):
         ):
             continue
 
+        # 特殊过滤逻辑：解决 100路(1001) 与 新K001路(971001) 数据串信号问题
+        if vehicle_id is not None:
+            vid_str = str(vehicle_id).strip()
+            # 100路（镇江公交）：vehicleId 必须为 4 位纯数字
+            if line_id == '1001':
+                if not (vid_str.isdigit() and len(vid_str) == 4):
+                    continue
+            # 新K001路（润港客运）：vehicleId 必须为 6 位纯数字
+            elif line_id == '971001':
+                if not (vid_str.isdigit() and len(vid_str) == 6):
+                    continue
+
         departure_time = format_plan_run_time(
             plan_run_time,
             scan_date
@@ -528,13 +540,8 @@ def run_one_scan(lines):
 
 
 if __name__ == '__main__':
-
-    print('=' * 60)
     print(
-        'zjgj_Fleet&Plate_Collector'
-    )
-    print(
-        'zjgj_Fleet&Plate_Collector v3.1'
+        'zjgj_Fleet&Plate_Collector v3.2'
     )
     print('=' * 60)
 
