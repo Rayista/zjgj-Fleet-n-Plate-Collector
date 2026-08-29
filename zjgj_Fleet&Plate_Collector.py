@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import time
 import threading
 from datetime import datetime
@@ -11,7 +12,10 @@ import requests
 from openpyxl import Workbook, load_workbook
 
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 LINE_CONFIG_FILE = os.path.join(
     BASE_DIR,
@@ -530,7 +534,7 @@ if __name__ == '__main__':
         'zjgj_Fleet&Plate_Collector'
     )
     print(
-        'zjgj_Fleet&Plate_Collector v3.0'
+        'zjgj_Fleet&Plate_Collector v3.1'
     )
     print('=' * 60)
 
