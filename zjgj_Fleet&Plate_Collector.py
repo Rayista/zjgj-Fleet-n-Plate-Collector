@@ -42,8 +42,22 @@ HEADERS = [
     '自编号',
     '车牌号',
     '发车时间',
-    '工号'
+    '工号',
+    '运营公司'
 ]
+
+# 定义相互串数据的关联线路组
+CROSS_LINE_GROUPS = [
+    {'zj_id': '1001',   'rg_id': '971001'},  # 100路 <-> 新K001路
+    {'zj_id': '1021',   'rg_id': '971021'},  # 102路 <-> 新K2路
+    {'zj_id': '1011',   'rg_id': '971101'},  # 101路 <-> 新K101路
+]
+
+# 构建快速查找映射表
+LINE_GROUP_MAP = {}
+for group in CROSS_LINE_GROUPS:
+    LINE_GROUP_MAP[group['zj_id']] = group
+    LINE_GROUP_MAP[group['rg_id']] = group
 
 _thread_local = threading.local()
 
@@ -169,7 +183,7 @@ def format_plan_run_time(plan_run_time, scan_date):
 
 
 def get_one_line_vehicle_info(line, mark, scan_date):
-    """获取一条线路一个方向的车辆信息。"""
+    """获取一条线路一个方向的车辆原始数据。"""
 
     line_id = line['id']
     line_name = format_line_name(line)
@@ -223,50 +237,116 @@ def get_one_line_vehicle_info(line, mark, scan_date):
         ):
             continue
 
-        # 特殊过滤逻辑：解决 100路(1001) 与 新K001路(971001) 数据串信号问题
-        if vehicle_id is not None:
-            vid_str = str(vehicle_id).strip()
-            # 100路（镇江公交）：vehicleId 必须为 4 位纯数字
-            if line_id == '1001':
-                if not (vid_str.isdigit() and len(vid_str) == 4):
-                    continue
-            # 新K001路（润港客运）：vehicleId 必须为 6 位纯数字
-            elif line_id == '971001':
-                if not (vid_str.isdigit() and len(vid_str) == 6):
-                    continue
-
         departure_time = format_plan_run_time(
             plan_run_time,
             scan_date
         )
 
-        result.append((
-            line_name,
-            direction,
-            vehicle_id,
-            vehicle_code,
-            departure_time,
-            driver_code
-        ))
+        result.append({
+            'source_line': line,
+            'direction': direction,
+            'vehicle_id': vehicle_id,
+            'vehicle_code': vehicle_code,
+            'departure_time': departure_time,
+            'driver_code': driver_code
+        })
 
     return result
 
 
+def process_group_data(raw_records, group_lines_map):
+    """对交叉关联组的所有原始数据进行重新归位与去重清洗。"""
+
+    cleaned_records = []
+    seen_keys = set()
+
+    for item in raw_records:
+        vehicle_id = item['vehicle_id']
+        if vehicle_id is None:
+            continue
+
+        vid_str = str(vehicle_id).strip()
+        if not vid_str.isdigit():
+            continue
+
+        target_line = None
+
+        # 核心判定规律：4位纯数字->镇江公交；6位纯数字->润港客运
+        if len(vid_str) == 4:
+            for lid, line_obj in group_lines_map.items():
+                if lid not in ('971001', '971021', '971101'):
+                    target_line = line_obj
+                    break
+        elif len(vid_str) == 6:
+            for lid, line_obj in group_lines_map.items():
+                if lid in ('971001', '971021', '971101'):
+                    target_line = line_obj
+                    break
+
+        if not target_line:
+            continue
+
+        line_name = format_line_name(target_line)
+        direction = item['direction']
+        v_code = item['vehicle_code']
+        dep_time = item['departure_time']
+        d_code = item['driver_code']
+        company = target_line.get('company', '')
+
+        # 组内去重 Key（按前 6 位，防止同一条数据在两边 API 重复出现）
+        dedup_key = (
+            line_name,
+            direction,
+            str(vehicle_id).strip(),
+            str(v_code).strip() if v_code is not None else None,
+            dep_time,
+            str(d_code).strip() if d_code is not None else None
+        )
+
+        if dedup_key in seen_keys:
+            continue
+
+        seen_keys.add(dedup_key)
+
+        cleaned_records.append((
+            line_name,
+            direction,
+            vehicle_id,
+            v_code,
+            dep_time,
+            d_code,
+            company
+        ))
+
+    return cleaned_records
+
+
 def get_vehicle_data(lines):
-    """并发获取所有线路上下行数据。"""
+    """并发获取所有线路上下行数据（自动交叉汇总清洗关联线路）。"""
 
     scan_date = datetime.now().strftime(
         '%Y-%m-%d'
     )
 
-    tasks = []
+    lines_by_id = {str(l['id']): l for l in lines}
+
+    normal_tasks = []
+    group_tasks_map = {}
 
     for line in lines:
-        tasks.append((line, 0))
-        tasks.append((line, 1))
+        lid = str(line['id'])
+        if lid in LINE_GROUP_MAP:
+            g_info = LINE_GROUP_MAP[lid]
+            g_key = f"{g_info['zj_id']}_{g_info['rg_id']}"
+            if g_key not in group_tasks_map:
+                group_tasks_map[g_key] = []
+            group_tasks_map[g_key].append((line, 0))
+            group_tasks_map[g_key].append((line, 1))
+        else:
+            normal_tasks.append((line, 0))
+            normal_tasks.append((line, 1))
 
-    result = []
-    total_tasks = len(tasks)
+    total_tasks = len(normal_tasks) + sum(len(v) for v in group_tasks_map.values())
     completed = 0
 
     print()
@@ -275,7 +355,7 @@ def get_vehicle_data(lines):
         f'[{datetime.now().isoformat()}] 开始扫描'
     )
     print(
-        f'线路：{len(lines)}条'
+        f'线路：{len(lines)}条（包含 {len(group_tasks_map)} 组关联交叉线路）'
     )
     print(
         f'请求：{total_tasks}个'
@@ -285,49 +365,88 @@ def get_vehicle_data(lines):
     )
     print('=' * 60)
 
+    task_results_by_group = {g_key: [] for g_key in group_tasks_map}
+    normal_cleaned_results = []
+
     with ThreadPoolExecutor(
         max_workers=MAX_WORKERS
     ) as executor:
 
-        future_map = {
-            executor.submit(
-                get_one_line_vehicle_info,
-                line,
-                mark,
-                scan_date
-            ): (line, mark)
-            for line, mark in tasks
-        }
+        future_map = {}
+
+        for line, mark in normal_tasks:
+            f = executor.submit(get_one_line_vehicle_info, line, mark, scan_date)
+            future_map[f] = ('normal', line, mark)
+
+        for g_key, tasks in group_tasks_map.items():
+            for line, mark in tasks:
+                f = executor.submit(get_one_line_vehicle_info, line, mark, scan_date)
+                future_map[f] = ('group', g_key, line, mark)
 
         for future in as_completed(future_map):
-
-            line, mark = future_map[future]
-
-            line_name = format_line_name(line)
-
-            direction = (
-                '上行'
-                if mark == 0
-                else '下行'
-            )
-
             completed += 1
+            info = future_map[future]
+            task_type = info[0]
 
             try:
-                data = future.result()
-                result.extend(data)
+                raw_data = future.result()
 
-                print(
-                    f'[{completed}/{total_tasks}] '
-                    f'{line_name} {direction}：'
-                    f'{len(data)}条'
-                )
+                if task_type == 'normal':
+                    _, line, mark = info
+                    line_name = format_line_name(line)
+                    direction = '上行' if mark == 0 else '下行'
+                    company = line.get('company', '')
+
+                    for item in raw_data:
+                        normal_cleaned_results.append((
+                            line_name,
+                            item['direction'],
+                            item['vehicle_id'],
+                            item['vehicle_code'],
+                            item['departure_time'],
+                            item['driver_code'],
+                            company
+                        ))
+
+                    print(
+                        f'[{completed}/{total_tasks}] '
+                        f'{line_name} {direction}：'
+                        f'{len(raw_data)}条'
+                    )
+
+                elif task_type == 'group':
+                    _, g_key, line, mark = info
+                    line_name = format_line_name(line)
+                    direction = '上行' if mark == 0 else '下行'
+
+                    task_results_by_group[g_key].extend(raw_data)
+
+                    print(
+                        f'[{completed}/{total_tasks}] '
+                        f'(关联组) {line_name} {direction}：'
+                        f'{len(raw_data)}条'
+                    )
 
             except Exception as e:
                 print(
                     f'[{completed}/{total_tasks}] '
-                    f'{line_name} {direction}失败：{e}'
+                    f'处理失败：{e}'
                 )
+
+    # 对关联组的数据进行归位与去重
+    final_group_results = []
+    for g_key, raw_group_data in task_results_by_group.items():
+        zj_id, rg_id = g_key.split('_')
+        g_lines_map = {}
+        if zj_id in lines_by_id:
+            g_lines_map[zj_id] = lines_by_id[zj_id]
+        if rg_id in lines_by_id:
+            g_lines_map[rg_id] = lines_by_id[rg_id]
+
+        cleaned_group_data = process_group_data(raw_group_data, g_lines_map)
+        final_group_results.extend(cleaned_group_data)
+
+    result = normal_cleaned_results + final_group_results
 
     print(
         f'[{datetime.now().isoformat()}] '
@@ -364,7 +483,7 @@ def normalize_datetime(value):
 
 
 def make_record_key(record):
-    """生成历史记录唯一键。"""
+    """生成历史记录唯一键（仍使用前6列生成唯一键，保持与旧数据一致）。"""
 
     departure_time = normalize_datetime(
         record[4]
@@ -392,7 +511,7 @@ def setup_excel_format(ws):
     """设置Excel筛选、冻结和列宽。"""
 
     ws.auto_filter.ref = (
-        f'A1:F{max(ws.max_row, 1)}'
+        f'A1:G{max(ws.max_row, 1)}'
     )
 
     ws.freeze_panes = 'A2'
@@ -403,7 +522,8 @@ def setup_excel_format(ws):
         'C': 15,
         'D': 15,
         'E': 22,
-        'F': 12
+        'F': 12,
+        'G': 15
     }
 
     for column, width in widths.items():
@@ -444,8 +564,8 @@ def create_excel(filepath):
     wb.close()
 
 
-def append_unique_to_excel(vehicle_list, filepath):
-    """追加新记录"""
+def append_unique_to_excel(vehicle_list, filepath, lines_config):
+    """追加新记录，并自动补全旧数据中缺失的运营公司"""
 
     if not os.path.exists(filepath):
         create_excel(filepath)
@@ -453,6 +573,7 @@ def append_unique_to_excel(vehicle_list, filepath):
     wb = load_workbook(filepath)
     ws = wb.active
 
+    # 1. 确保表头更新为 7 列
     for column, header in enumerate(
         HEADERS,
         start=1
@@ -463,26 +584,42 @@ def append_unique_to_excel(vehicle_list, filepath):
             value=header
         )
 
+    # 建立“线路名称 -> 运营公司”的查找词典，用于为旧表格数据补全 company
+    name_to_company = {l['name']: l['company'] for l in lines_config}
+
     existing = set()
 
-    for row in ws.iter_rows(
-        min_row=2,
-        max_col=6,
-        values_only=True
-    ):
+    # 2. 读取并检查旧数据，给缺失 company 的历史行自动补充
+    for r_idx in range(2, ws.max_row + 1):
+        row_cells = [ws.cell(row=r_idx, column=c) for c in range(1, 8)]
+        row_vals = [cell.value for cell in row_cells]
 
-        if all(value is None for value in row):
+        if all(value is None for value in row_vals):
             continue
 
+        # 前6位存入唯一键集合，用于新记录去重
         existing.add(
-            make_record_key(list(row))
+            make_record_key(row_vals[:6])
         )
 
+        # 补全既有数据中空的“运营公司”列（第7列）
+        line_name = row_vals[0]
+        company_val = row_vals[6]
+
+        if (company_val is None or str(company_val).strip() == '') and line_name:
+            if line_name in name_to_company:
+                ws.cell(
+                    row=r_idx,
+                    column=7,
+                    value=name_to_company[line_name]
+                )
+
+    # 3. 追加新获取的数据
     to_append = []
 
     for item in vehicle_list:
 
-        key = make_record_key(item)
+        key = make_record_key(item[:6])
 
         if key in existing:
             continue
@@ -527,7 +664,8 @@ def run_one_scan(lines):
 
     added = append_unique_to_excel(
         vehicle_data,
-        EXCEL_FILE
+        EXCEL_FILE,
+        lines
     )
 
     print(
@@ -541,7 +679,7 @@ def run_one_scan(lines):
 
 if __name__ == '__main__':
     print(
-        'zjgj_Fleet&Plate_Collector v3.2'
+        'zjgj_Fleet&Plate_Collector v3.5'
     )
     print('=' * 60)
 
